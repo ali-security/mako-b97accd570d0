@@ -1,25 +1,23 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest posargs (e.g. test/test_lookup.py or -k pattern)"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       # run this job using this matrix
       matrix:
         os:
-          - "ubuntu-latest"
+          - "ubuntu-22.04"
           - "windows-latest"
           - "macos-latest"
         python-version:
@@ -33,25 +31,82 @@ jobs:
           # See https://github.com/bbangert/beaker/pull/213
           - os: "windows-latest"
             python-version: "3.10"
+          # the x64 macOS runners upstream used are retired; the only macOS
+          # runner left is arm64, and CPython has no arm64 darwin build before
+          # 3.9.1 — the runner cannot execute these two legs at all.
+          - os: "macos-latest"
+            python-version: "3.7"
+          - os: "macos-latest"
+            python-version: "3.8"
 
       fail-fast: false
+
+    env:
+      # resolve tox and the test dependencies as they existed at the 1.2.4 release
+      PIP_INDEX_URL: "https://:2022-11-15@time-machines-pypi.sealsecurity.io/"
 
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.architecture }}
+
+      # setup-python has no darwin-arm64 manifest entry for 3.9/3.10; this
+      # drop-in builds the interpreter from source when no prebuilt exists.
+      - name: Set up python (macOS arm64)
+        if: runner.os == 'macOS'
+        uses: MatteoH2O1999/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tox setuptools
+          # setuptools is pinned, not just --upgraded: the runner image ships a
+          # setuptools far newer than the packaging the release-era index
+          # resolves, and pip --upgrade never downgrades it.
+          pip install --upgrade tox "setuptools==65.5.1"
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+  build-artifacts:
+    name: build-artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    env:
+      PIP_INDEX_URL: "https://:2022-11-15@time-machines-pypi.sealsecurity.io/"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools==65.5.1" "wheel==0.38.4" "build==0.9.0"
+          pip list
+
+      - name: Build sdist and wheel
+        run: python -m build --no-isolation
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
